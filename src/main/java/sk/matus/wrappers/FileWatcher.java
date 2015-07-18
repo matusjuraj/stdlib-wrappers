@@ -148,5 +148,7 @@ public class FileWatcher {
 			}
 		}
 	}
+	
+	public void clean() {}
 
 }

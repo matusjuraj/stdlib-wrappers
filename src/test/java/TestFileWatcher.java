@@ -1,219 +1,193 @@
 import static org.mockito.Mockito.verify;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.function.Consumer;
+import java.util.stream.Stream;
+
 
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.ArgumentMatcher;
 import org.mockito.Mockito;
 
 import sk.matus.wrappers.FileWatcher;
 
-
-@SuppressWarnings("unchecked")
 public class TestFileWatcher {
-
-	private List<Path> files;
 	
-	private List<Path> dirs;
+	public interface ThrowingConsumer {
+		
+		public void accept(FileWatcher fw, Utils.MockMethods m) throws Exception;
+		
+	}
+
+	private Path[] existentFiles;
+	
+	private Path[] watchedDirs;
+	private Path[] deepDirs;
+	private Path nonwatchedDir;
 	
 	@Before
 	public void setUp() throws Exception {
-		dirs = new ArrayList<>();
-		for (Path path : Arrays.asList(
-			Paths.get("watched1/"),
-			Paths.get("watched2/"),
-			Paths.get("nonwatched/"))) {
-			
-			Files.createDirectories(path);
-			dirs.add(path);
-		}
+		watchedDirs = new Path[] {
+			Utils.p("watched%d/"),
+			Utils.p("recursive%d/")
+		};
+		deepDirs = new Path[] {
+			Utils.p(watchedDirs[1], "deep"),
+			null
+		};
+		deepDirs[1] = Utils.p(deepDirs[0], "verydeep");
 		
-		files = new ArrayList<>();
-		for (Path path : Arrays.asList(
-			Paths.get("watched1/file1.txt"),
-			Paths.get("watched1/file2.txt"),
-			Paths.get("watched2/file3.png"))) {
-			
-			if (Files.notExists(path)) {
-				Files.createFile(path);
-			}
-			files.add(path);
-		}
+		nonwatchedDir = Utils.p("nonwatched%d/");
+		
+		Stream.concat(
+			Stream.concat(
+				Stream.of(watchedDirs), Stream.of(deepDirs)),
+			Stream.of(nonwatchedDir)).forEach(p -> {
+				try {
+					Files.createDirectories(p);
+				} catch (IOException e) {}
+			});
+		
+		existentFiles = new Path[] {
+			Utils.p(watchedDirs[0], "file1.txt"),
+			Utils.p(watchedDirs[1], ".hidden")
+		};
+		
+		Stream.of(existentFiles).forEach(p -> {
+			try {
+				Files.createFile(p);
+			} catch (IOException e) {}
+		});
 	}
-	
-	private static class PathMatcher extends ArgumentMatcher<Path> {
 
-		private final Path path;
-		
-		public PathMatcher(Path path) {
-			this.path = path;
-		}
-		
-		@Override
-		public boolean matches(Object argument) {
-			if (argument instanceof Path) {
-				return path.toAbsolutePath().normalize().equals(
-					((Path) argument).toAbsolutePath().normalize());
-			}
-			return false;
-		}
-
-	}
-	
 	@After
 	public void tearDown() throws Exception {
-		for (Path path : dirs) {
+		for (Path path : watchedDirs) {
 			FileUtils.deleteDirectory(path.toFile());
 		}
 	}
 	
-	@Test
-	public void onCreate_shouldBeCalled_whenFileIsCreatedInWatchedDirectory() throws Exception {
-		Consumer<Path> onCreate = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(onCreate, p -> {}, p -> {}, dirs.get(0), dirs.get(1));
+	private void testFileWatcher(ThrowingConsumer body) throws Exception {
+		Utils.MockMethods m = new Utils.MockMethods();
+		FileWatcher fw = FileWatcher.create(m.onCreate, m.onModify, m.onDelete, watchedDirs);
 		fw.start();
 		
-		Path path = Paths.get("watched1/newfile.jpg");
-		Files.createFile(path);
-		Thread.sleep(40);
+		body.accept(fw, m);
 		
-		verify(onCreate, Mockito.times(1)).accept(Mockito.argThat(new PathMatcher(path)));
-		fw.stop();
+		fw.clean();
+	}
+	
+	@Test
+	public void onCreate_shouldBeCalled_whenFileIsCreatedInWatchedDirectory() throws Exception {
+		testFileWatcher((fw, m) -> {
+			Path path = Utils.p(watchedDirs[0], "newfile.jpg");
+			Files.createFile(path);
+			Thread.sleep(40);
+			
+			verify(m.onCreate, Mockito.times(1)).accept(Utils.pathEq(path));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onCreate_shouldNotBeCalled_whenFileIsCreatedOutsideWatchedDirectory() throws Exception {
-		Consumer<Path> onCreate = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(onCreate, p -> {}, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		
-		Path path = Paths.get("nonwatched/newfile.jpg");
-		Files.createFile(path);
-		Thread.sleep(40);
-		
-		verify(onCreate, Mockito.never()).accept(Mockito.argThat(new PathMatcher(path)));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Path path = Utils.p(nonwatchedDir, "newfile.jpg");
+			Files.createFile(path);
+			Thread.sleep(40);
+			
+			verify(m.onCreate, Mockito.never()).accept(Mockito.any(Path.class));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onCreate_shouldNotBeCalled_whenNothingIsCreated() throws Exception {
-		Consumer<Path> onCreate = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(onCreate, p -> {}, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		Thread.sleep(40);
-		
-		verify(onCreate, Mockito.never()).accept(Mockito.any(Path.class));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Thread.sleep(40);
+			
+			verify(m.onCreate, Mockito.never()).accept(Mockito.any(Path.class));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onCreate_shouldNotBeCalled_whenFileIsCreatedInWatchedDirectoryAfterStopCall() throws Exception {
-		Consumer<Path> onCreate = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(onCreate, p -> {}, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		fw.stop();
-		
-		Path path = Paths.get("nonwatched/newfile.jpg");
-		Files.createFile(path);
-		Thread.sleep(40);
-		
-		verify(onCreate, Mockito.never()).accept(Mockito.argThat(new PathMatcher(path)));
+		testFileWatcher((fw, m) -> {
+			fw.stop();
+			Path path = Utils.p(watchedDirs[0], "newfile.jpg");
+			Files.createFile(path);
+			Thread.sleep(40);
+			
+			verify(m.onCreate, Mockito.never()).accept(Mockito.any(Path.class));
+		});
 	}
 	
 	@Test
 	public void onModify_shouldBeCalled_whenFileIsModifiedInWatchedDirectory() throws Exception {
-		Consumer<Path> onModify = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, onModify, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		
-		Path path = files.get(0);
-		Files.write(path, "akjsakjd".getBytes());
-		Thread.sleep(40);
-		
-		verify(onModify, Mockito.atLeastOnce()).accept(Mockito.argThat(new PathMatcher(path)));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Files.write(existentFiles[0], "aaakjfhdkjfhj".getBytes());
+			Thread.sleep(40);
+			
+			verify(m.onModify, Mockito.atLeastOnce()).accept(Utils.pathEq(existentFiles[0]));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onModify_shouldNotBeCalled_whenNothingIsModified() throws Exception {
-		Consumer<Path> onModify = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, onModify, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		Thread.sleep(40);
-		
-		verify(onModify, Mockito.never()).accept(Mockito.any(Path.class));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Thread.sleep(40);
+			
+			verify(m.onModify, Mockito.never()).accept(Mockito.any(Path.class));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onModify_shouldNotBeCalled_whenFileIsModifiedInWatchedDirectoryAfterStopCall() throws Exception {
-		Consumer<Path> onModify = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, onModify, p -> {}, dirs.get(0), dirs.get(1));
-		fw.start();
-		fw.stop();
-		
-		Path path = files.get(0);
-		Files.write(path, "akjsakjd".getBytes());
-		Thread.sleep(40);
-		
-		verify(onModify, Mockito.never()).accept(Mockito.argThat(new PathMatcher(path)));
+		testFileWatcher((fw, m) -> {
+			fw.stop();
+			Files.write(existentFiles[0], "aaakjfhdkjfhj".getBytes());
+			Thread.sleep(40);
+			
+			verify(m.onModify, Mockito.never()).accept(Mockito.any(Path.class));
+		});
 	}
 	
 	@Test
 	public void onDelete_shouldBeCalled_whenFileIsDeletedInWatchedDirectory() throws Exception {
-		Consumer<Path> onDelete = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, p -> {}, onDelete, dirs.get(0), dirs.get(1));
-		fw.start();
-		
-		Path path = files.get(1);
-		Files.delete(path);
-		Thread.sleep(40);
-		
-		verify(onDelete, Mockito.times(1)).accept(Mockito.argThat(new PathMatcher(path)));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Files.deleteIfExists(existentFiles[1]);
+			Thread.sleep(40);
+			
+			verify(m.onDelete, Mockito.times(1)).accept(Utils.pathEq(existentFiles[1]));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onDelete_shouldNotBeCalled_whenNothingIsDeleted() throws Exception {
-		Consumer<Path> onDelete = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, p -> {}, onDelete, dirs.get(0), dirs.get(1));
-		fw.start();
-		Thread.sleep(40);
-		
-		verify(onDelete, Mockito.never()).accept(Mockito.any(Path.class));
-		fw.stop();
+		testFileWatcher((fw, m) -> {
+			Thread.sleep(40);
+			
+			verify(m.onDelete, Mockito.never()).accept(Mockito.any(Path.class));
+			fw.stop();
+		});
 	}
 	
 	@Test
 	public void onDelete_shouldNotBeCalled_whenFileIsDeletedInWatchedDirectoryAfterStopCall() throws Exception {
-		Consumer<Path> onDelete = Mockito.mock(Consumer.class);
-		
-		FileWatcher fw = FileWatcher.create(p -> {}, p -> {}, onDelete, dirs.get(0), dirs.get(1));
-		fw.start();
-		fw.stop();
-		
-		Path path = files.get(1);
-		Files.delete(path);
-		Thread.sleep(40);
-		verify(onDelete, Mockito.never()).accept(Mockito.argThat(new PathMatcher(path)));
+		testFileWatcher((fw, m) -> {
+			fw.stop();
+			Files.deleteIfExists(existentFiles[1]);
+			Thread.sleep(40);
+			
+			verify(m.onDelete, Mockito.never()).accept(Mockito.any(Path.class));
+		});
 	}
 	
 }
