@@ -59,7 +59,7 @@ public class FileWatcher {
 			try {
 				return Files.walk(p);
 			} catch (Exception e) {
-				return Stream.empty();
+				return Stream.of(p);
 			}
 		}).toArray(l -> new Path[l]);
 		

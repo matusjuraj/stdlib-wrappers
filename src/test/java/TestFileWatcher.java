@@ -78,6 +78,21 @@ public class TestFileWatcher {
 		FileUtils.deleteDirectory(nonwatchedDir.toFile());
 	}
 	
+	@AfterClass
+	public static void cleanup() throws IOException {
+		Files.newDirectoryStream(Paths.get("src/test/resources/")).forEach(p -> {
+			if (Files.isDirectory(p)) {
+				try {
+					FileUtils.deleteDirectory(p.toFile());
+				} catch (IOException e) {}
+			} else {
+				try {
+					Files.delete(p);
+				} catch (Exception e) {}
+			}
+		});
+	}
+	
 	private void testFileWatcher(ThrowingConsumer body, FileWatcherType type) throws Exception {
 		Utils.MockMethods m = new Utils.MockMethods();
 		FileWatcher fw;
@@ -331,19 +346,16 @@ public class TestFileWatcher {
 		}, FileWatcherType.RECURSIVE);
 	}
 	
-	@AfterClass
-	public static void cleanup() throws IOException {
-		Files.newDirectoryStream(Paths.get("src/test/resources/")).forEach(p -> {
-			if (Files.isDirectory(p)) {
-				try {
-					FileUtils.deleteDirectory(p.toFile());
-				} catch (IOException e) {}
-			} else {
-				try {
-					Files.delete(p);
-				} catch (Exception e) {}
-			}
-		});
+	@Test
+	public void inRecursive_onCreate_shouldBeCalled_whenFileIsCreatedInWatchedDirectory() throws Exception {
+		testFileWatcher((fw, m) -> {
+			Path path = Utils.p(watchedDirs[0], "newfile.jpg");
+			Files.createFile(path);
+			Thread.sleep(5);
+			
+			verify(m.onCreate, Mockito.times(1)).accept(Utils.pathEq(path));
+			fw.stop();
+		}, FileWatcherType.RECURSIVE);
 	}
 	
 	@Test
