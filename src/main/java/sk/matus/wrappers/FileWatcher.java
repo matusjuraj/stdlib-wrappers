@@ -3,17 +3,21 @@ package sk.matus.wrappers;
 import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystems;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchEvent.Kind;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Vector;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import org.javatuples.Pair;
 
@@ -35,9 +39,64 @@ public class FileWatcher {
 		Consumer<Path> onDelete, Path... paths) throws IOException {
 		
 		return new FileWatcher(onCreate, onModify, onDelete, paths);
-		
 	}
 	
+	/**
+	 * 
+	 * Creates a FileWatcher for given paths reacting with given callbacks
+	 * Watches all directories deep into the passed directories
+	 * @param onCreate Callback to create event
+	 * @param onModify Callback to modify event
+	 * @param onDelete Callback to delete event
+	 * @param paths Watched directories
+	 * @return
+	 * @throws IOException
+	 */
+	public static FileWatcher createRecursive(Consumer<Path> onCreate, Consumer<Path> onModify,
+		Consumer<Path> onDelete, Path... paths) throws IOException {
+		
+		Path[] recursivePaths = Stream.of(paths).flatMap(p -> {
+			try {
+				return Files.walk(p);
+			} catch (Exception e) {
+				return Stream.empty();
+			}
+		}).toArray(l -> new Path[l]);
+		
+		return create(onCreate, onModify, onDelete, recursivePaths);
+	}
+	
+	/**
+	 * 
+	 * Creates a FileWatcher for given paths reacting with given callbacks
+	 * Watches all directories deep into the passed directories, registering new direcotries if created
+	 * @param onCreate Callback to create event
+	 * @param onModify Callback to modify event
+	 * @param onDelete Callback to delete event
+	 * @param paths Watched directories
+	 * @return
+	 * @throws IOException
+	 */
+	public static FileWatcher createRecursiveAdaptive(Consumer<Path> onCreate, Consumer<Path> onModify,
+		Consumer<Path> onDelete, Path... paths) throws IOException {
+		
+		AtomicReference<FileWatcher> fw = new AtomicReference<>();
+		
+		Consumer<Path> onCreateRegisterNew = path -> {
+			if (Files.isDirectory(path)) {
+				fw.get().registerPaths(fw.get().additions, path);
+			}
+		};
+		onCreate = onCreateRegisterNew.andThen(onCreate);
+		
+		fw.set(createRecursive(onCreate, onModify, onDelete, paths));
+		return fw.get();
+	}
+	
+	/**
+	 * Running state of FileWatcher
+	 *
+	 */
 	private enum State {
 		PREPARED,
 		RUNNING,
@@ -45,6 +104,8 @@ public class FileWatcher {
 	}
 	
 	private final List<Pair<Path, WatchService>> services;
+	
+	private final LinkedList<Pair<Path, WatchService>> additions;
 	
 	private final Consumer<Path> onCreate;
 	
@@ -58,25 +119,42 @@ public class FileWatcher {
 		Consumer<Path> onDelete, Path... paths) {
 		
 		this.services = new Vector<>();
+		this.additions = new LinkedList<>();
 		
 		this.onCreate = onCreate;
 		this.onModify = onModify;
 		this.onDelete = onDelete;
 		
-		registerPaths(paths);
+		registerPaths(services, paths);
 	}
 	
 	/**
 	 * Creates watch service for each path and registers it to them
 	 * @param paths
 	 */
-	private void registerPaths(Path... paths) {
+	private void registerPaths(List<Pair<Path, WatchService>> into, Path... paths) {
 		for (Path path : paths) {
+			
+			// Do not register the same path repeatedly
+			if (services.stream()
+				.map(pw -> pw.getValue0())
+				.filter(p -> {
+					try {
+						return Files.isSameFile(path, p);
+					} catch (IOException e) {
+						return false;
+					}
+				})
+				.findFirst()
+				.isPresent()) {
+				continue;
+			}
+			
 			WatchService ws = null;
 			try {
 				ws = FileSystems.getDefault().newWatchService();
 				path.register(ws, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY);
-				services.add(new Pair<>(path, ws));
+				into.add(new Pair<>(path, ws));
 			} catch (IOException e) {
 				if (ws != null) {
 					try {
@@ -96,12 +174,26 @@ public class FileWatcher {
 		
 		Iterator<Pair<Path, WatchService>> iterator;
 		
+		LinkedList<Pair<Path, WatchService>> toRemove = new LinkedList<>();
+		
 		private Pair<Path, WatchService> next() {
 			
 			if (iterator == null || !iterator.hasNext()) {
+				
+				// Apply remove queue
+				while (toRemove.size() > 0) {
+					services.remove(toRemove.pop());
+				}
+				
+				// Apply add queue
+				while (additions.size() > 0) {
+					services.add(additions.pop());
+				}
+				
 				iterator = services.iterator();
 				if (!iterator.hasNext()) {
 					stop();
+					return null;
 				}
 			}
 			
@@ -116,10 +208,10 @@ public class FileWatcher {
 				
 				WatchKey key;
 				try {
-					key = pathAndWs.getValue1().poll();
+					key = pathAndWs == null ? null : pathAndWs.getValue1().poll();
 				} catch (ClosedWatchServiceException e) {
 					key = null;
-					iterator.remove();
+					toRemove.add(pathAndWs);
 				}
 				
 				if (key != null) {
@@ -143,7 +235,7 @@ public class FileWatcher {
 					}
 					
 					if (!key.reset()) {
-						services.remove(pathAndWs);
+						toRemove.add(pathAndWs);
 					}
 				}
 				
