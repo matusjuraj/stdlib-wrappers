@@ -9,8 +9,8 @@ import java.nio.file.WatchEvent.Kind;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
+import java.util.Vector;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -21,6 +21,29 @@ import static java.nio.file.StandardWatchEventKinds.*;
 
 public class FileWatcher {
 	
+	/**
+	 * 
+	 * Creates a FileWatcher for given paths reacting with given callbacks
+	 * @param onCreate Callback to create event
+	 * @param onModify Callback to modify event
+	 * @param onDelete Callback to delete event
+	 * @param paths Watched directories
+	 * @return
+	 * @throws IOException
+	 */
+	public static FileWatcher create(Consumer<Path> onCreate, Consumer<Path> onModify,
+		Consumer<Path> onDelete, Path... paths) throws IOException {
+		
+		return new FileWatcher(onCreate, onModify, onDelete, paths);
+		
+	}
+	
+	private enum State {
+		PREPARED,
+		RUNNING,
+		STOPPED
+	}
+	
 	private final List<Pair<Path, WatchService>> services;
 	
 	private final Consumer<Path> onCreate;
@@ -29,12 +52,12 @@ public class FileWatcher {
 	
 	private final Consumer<Path> onDelete;
 	
-	private boolean running = false;
+	private State state = State.PREPARED;
 	
 	private FileWatcher(Consumer<Path> onCreate, Consumer<Path> onModify,
-		Consumer<Path> onDelete, Path... paths) throws IOException {
+		Consumer<Path> onDelete, Path... paths) {
 		
-		this.services = new LinkedList<>();
+		this.services = new Vector<>();
 		
 		this.onCreate = onCreate;
 		this.onModify = onModify;
@@ -43,21 +66,32 @@ public class FileWatcher {
 		registerPaths(paths);
 	}
 	
-	public static FileWatcher create(Consumer<Path> onCreate, Consumer<Path> onModify,
-		Consumer<Path> onDelete, Path... paths) throws IOException {
-		
-		return new FileWatcher(onCreate, onModify, onDelete, paths);
-		
-	}
-	
-	private void registerPaths(Path... paths) throws IOException {
+	/**
+	 * Creates watch service for each path and registers it to them
+	 * @param paths
+	 */
+	private void registerPaths(Path... paths) {
 		for (Path path : paths) {
-			WatchService ws = FileSystems.getDefault().newWatchService();
-			path.register(ws, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY);
-			services.add(new Pair<>(path, ws));
+			WatchService ws = null;
+			try {
+				ws = FileSystems.getDefault().newWatchService();
+				path.register(ws, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY);
+				services.add(new Pair<>(path, ws));
+			} catch (IOException e) {
+				if (ws != null) {
+					try {
+						ws.close();
+					} catch (IOException e1) {}
+				}
+			}
 		}
 	}
 	
+	/**
+	 * Runnable that periodically polls all watch services of FileWatcher
+	 * and invokes callbacks as necessary
+	 *
+	 */
 	public class WatchServiceLoop implements Runnable {
 		
 		Iterator<Pair<Path, WatchService>> iterator;
@@ -65,9 +99,9 @@ public class FileWatcher {
 		private Pair<Path, WatchService> next() {
 			
 			if (iterator == null || !iterator.hasNext()) {
-				iterator = FileWatcher.this.services.iterator();
+				iterator = services.iterator();
 				if (!iterator.hasNext()) {
-					throw new IllegalStateException("No paths are registered to watch");
+					stop();
 				}
 			}
 			
@@ -80,7 +114,7 @@ public class FileWatcher {
 			while (true) {
 				Pair<Path, WatchService> pathAndWs = next();
 				
-				WatchKey key;				
+				WatchKey key;
 				try {
 					key = pathAndWs.getValue1().poll();
 				} catch (ClosedWatchServiceException e) {
@@ -97,11 +131,11 @@ public class FileWatcher {
 							((WatchEvent<Path>) event).context());
 						
 						if (kind == ENTRY_CREATE) {
-							FileWatcher.this.onCreate.accept(path);
+							onCreate.accept(path);
 						} else if (kind == ENTRY_MODIFY) {
-							FileWatcher.this.onModify.accept(path);
+							onModify.accept(path);
 						} else if (kind == ENTRY_DELETE) {
-							FileWatcher.this.onDelete.accept(path);
+							onDelete.accept(path);
 						} else if (kind == OVERFLOW) {
 							continue;
 						}
@@ -109,12 +143,13 @@ public class FileWatcher {
 					}
 					
 					if (!key.reset()) {
-						FileWatcher.this.stop();
+						services.remove(pathAndWs);
 					}
 				}
 				
-				synchronized (FileWatcher.this) {
-					if (!FileWatcher.this.running) {
+				synchronized (state) {
+					if (state != State.RUNNING) {
+						clean();
 						break;
 					}
 				}
@@ -123,32 +158,54 @@ public class FileWatcher {
 		
 	}
 	
+	/**
+	 * Starts watch service in thread scheduled by executor service
+	 * @param executorService
+	 */
 	public void start(ExecutorService executorService) {
-		synchronized (this) {
-			this.running = true;
+		synchronized (this.state) {
+			if (this.state == State.RUNNING) {
+				return;
+			}
+			
+			if (this.state == State.STOPPED) {
+				throw new RuntimeException("FileWatcher has been already stopped");
+			}
+			
+			this.state = State.RUNNING;
 		}
 		executorService.execute(new WatchServiceLoop());
 	}
 	
+	/**
+	 * Starts watch service in internally managed thread
+	 */
 	public void start() {
 		ExecutorService executorService = Executors.newSingleThreadExecutor();
 		start(executorService);
 		executorService.shutdown();
 	}
 	
+	/**
+	 * Stops watch service and cleans resources
+	 */
 	public void stop() {
-		synchronized (this) {
-			this.running = false;
+		synchronized (this.state) {
+			this.state = State.STOPPED;
 		}
-		for (Pair<Path, WatchService> service : this.services) {
+	}
+	
+	/**
+	 * Cleans resources
+	 */
+	public void clean() {
+		for (Pair<Path, WatchService> pathAndWs : services) {
 			try {
-				service.getValue1().close();
+				pathAndWs.getValue1().close();
 			} catch (IOException e) {
 				e.printStackTrace();
 			}
 		}
 	}
-	
-	public void clean() {}
 
 }
